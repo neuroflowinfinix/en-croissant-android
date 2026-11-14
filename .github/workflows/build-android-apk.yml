@@ -88,7 +88,8 @@ jobs:
           if [ ! -f "$ICON_SRC" ]; then
             ICON_SRC="$GITHUB_WORKSPACE/src-tauri/icons/128x128@2x.png"
           fi
-          for dir in android/app/src/main/res/mipmap-*; do
+          for dpi in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            dir="android/app/src/main/res/mipmap-$dpi"
             if [ -d "$dir" ]; then
               cp "$ICON_SRC" "$dir/ic_launcher.png" 2>/dev/null || true
               cp "$ICON_SRC" "$dir/ic_launcher_round.png" 2>/dev/null || true
@@ -109,7 +110,8 @@ jobs:
         run: |
           cd /tmp/cap-apk/android
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          echo "sdk.dir=${ANDROID_HOME:-/usr/local/lib/android/sdk}" > local.properties
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Sign & Verify Android 9+ APK
         run: |
