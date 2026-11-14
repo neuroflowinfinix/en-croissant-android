@@ -1,0 +1,134 @@
+name: Build En Croissant Android APK (Exact PC UI + Stockfish 19)
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-android-apk:
+    name: Build Exact En Croissant PC UI & Stockfish 19 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Clone Official franciscoBSalgueiro/en-croissant Repository
+        run: |
+          if [ ! -d "src" ] || [ ! -f "vite.config.ts" ]; then
+            echo "Cloning official franciscoBSalgueiro/en-croissant (74 MB)..."
+            git clone --depth 1 https://github.com/franciscoBSalgueiro/en-croissant.git /tmp/ec-upstream
+            rm -rf /tmp/ec-upstream/.git /tmp/ec-upstream/.github
+            cp -rn /tmp/ec-upstream/* .
+            cp -rn /tmp/ec-upstream/.* . 2>/dev/null || true
+          fi
+
+      - name: Configure Pre-Installed Java 21 / 17 & pnpm
+        run: |
+          if [ -d "/usr/lib/jvm/temurin-21-jdk-amd64" ]; then
+            export JAVA_HOME="/usr/lib/jvm/temurin-21-jdk-amd64"
+          elif [ -d "/usr/lib/jvm/java-21-openjdk-amd64" ]; then
+            export JAVA_HOME="/usr/lib/jvm/java-21-openjdk-amd64"
+          elif [ -d "/usr/lib/jvm/temurin-17-jdk-amd64" ]; then
+            export JAVA_HOME="/usr/lib/jvm/temurin-17-jdk-amd64"
+          fi
+          echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
+          echo "$JAVA_HOME/bin" >> $GITHUB_PATH
+          java -version
+          npm install -g pnpm@9 esbuild
+
+      - name: Install En Croissant Frontend Dependencies + chess.js + Capacitor Android
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm add -w chess.js@1.0.0-beta.8 @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/android@6.2.0 || pnpm add chess.js@1.0.0-beta.8 @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/android@6.2.0
+
+      - name: Bundle Tauri Android Runtime & Download Stockfish 19.0.1 WASM
+        run: |
+          npx esbuild scripts/tauri-android-runtime.ts --bundle --format=iife --platform=browser --outfile=public/tauri-android-runtime.js
+          node scripts/prepare-capacitor-android.mjs
+
+      - name: Compile Untouched En Croissant PC Frontend with Vite
+        run: |
+          npx vite build --config vite.android.config.ts
+
+      - name: Generate Android Project, Set Landscape Orientation & Copy Official Icons
+        run: |
+          npx cap add android
+          npx cap copy android
+
+          # Copy official En Croissant icon.png from src-tauri/icons/ into all Android mipmap folders
+          ICON_SRC="src-tauri/icons/icon.png"
+          if [ ! -f "$ICON_SRC" ]; then
+            ICON_SRC="src-tauri/icons/128x128@2x.png"
+          fi
+          for dir in android/app/src/main/res/mipmap-*; do
+            if [ -d "$dir" ]; then
+              cp "$ICON_SRC" "$dir/ic_launcher.png" 2>/dev/null || true
+              cp "$ICON_SRC" "$dir/ic_launcher_round.png" 2>/dev/null || true
+              cp "$ICON_SRC" "$dir/ic_launcher_foreground.png" 2>/dev/null || true
+            fi
+          done
+
+          # Configure Horizontal (sensorLandscape) PC Layout & Cleartext/Internet in AndroidManifest.xml
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            sed -i 's/android:name=".MainActivity"/android:name=".MainActivity" android:screenOrientation="sensorLandscape"/g' "$MANIFEST"
+          fi
+
+          # Set minSdkVersion to 28 (Android 9.0+) in variables.gradle
+          if [ -f "android/variables.gradle" ]; then
+            sed -i 's/minSdkVersion = [0-9]*/minSdkVersion = 28/g' android/variables.gradle
+          fi
+
+      - name: Assemble Release APK with Gradle
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign & Verify Android 9+ APK
+        run: |
+          UNSIGNED_APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          echo "Found unsigned APK: $UNSIGNED_APK"
+
+          keytool -genkey -v -keystore release-key.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias encroissant -storepass encroissant123 -keypass encroissant123 \
+            -dname "CN=neuroflowinfinix, OU=ChessCommunity, O=EnCroissant, L=Maharashtra, S=MH, C=IN"
+
+          export ANDROID_SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" | sort -V | tail -n 1)
+          ZIPALIGN=$(find "$ANDROID_SDK_ROOT/build-tools" -name "zipalign" | sort -V | tail -n 1)
+
+          "$ZIPALIGN" -v -p 4 "$UNSIGNED_APK" en-croissant-aligned.apk
+          "$APKSIGNER" sign --ks release-key.jks --ks-key-alias encroissant \
+            --ks-pass pass:encroissant123 --key-pass pass:encroissant123 \
+            --out en-croissant-v0.16.1-android-arm64.apk en-croissant-aligned.apk
+          "$APKSIGNER" verify -v en-croissant-v0.16.1-android-arm64.apk
+          ls -lh en-croissant-v0.16.1-android-arm64.apk
+
+      - name: Upload Signed Android APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: en-croissant-android-apk
+          path: en-croissant-v0.16.1-android-arm64.apk
+          retention-days: 90
+
+      - name: Publish Signed APK to GitHub Releases
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete v0.16.1-android --yes 2>/dev/null || true
+          gh release create v0.16.1-android en-croissant-v0.16.1-android-arm64.apk \
+            --title "En Croissant Android v0.16.1 (Exact Landscape PC UI + Stockfish 19.0.1 WASM)" \
+            --notes "Built for the chess community by neuroflowinfinix (D. Ujjwal) <neuroflow_infinix@outlook.in>. Exact franciscoBSalgueiro/en-croissant PC interface in horizontal landscape mode with real Lichess chessground board & arrows and real nmrugg/stockfish.js v19.0.1 WASM engine. Compatible with Android 9.0 (API 28) and above."
