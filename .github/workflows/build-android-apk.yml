@@ -33,7 +33,7 @@ jobs:
             cp -rn /tmp/ec-upstream/.* . 2>/dev/null || true
           fi
 
-      - name: Configure Pre-Installed Java 21 / 17 & pnpm
+      - name: Configure Pre-Installed Java 21 / 17 & pnpm@latest
         run: |
           if [ -d "/usr/lib/jvm/temurin-21-jdk-amd64" ]; then
             export JAVA_HOME="/usr/lib/jvm/temurin-21-jdk-amd64"
@@ -45,31 +45,48 @@ jobs:
           echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
           echo "$JAVA_HOME/bin" >> $GITHUB_PATH
           java -version
-          npm install -g pnpm@9 esbuild
+          npm install -g pnpm@latest
 
-      - name: Install En Croissant Frontend Dependencies + chess.js + Capacitor Android
+      - name: Install En Croissant Frontend Dependencies
         run: |
-          pnpm install --no-frozen-lockfile
-          pnpm add -w chess.js@1.0.0-beta.8 @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/android@6.2.0 || pnpm add chess.js@1.0.0-beta.8 @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/android@6.2.0
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            delete p.packageManager;
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+          pnpm install --no-frozen-lockfile --ignore-scripts || npm install --legacy-peer-deps --ignore-scripts
+          pnpm rebuild esbuild 2>/dev/null || npm rebuild esbuild 2>/dev/null || true
 
-      - name: Bundle Tauri Android Runtime & Download Stockfish 19.0.1 WASM
+      - name: Bundle Tauri Android Runtime (in Isolated Builder) & Download Stockfish 19.0.1 WASM
         run: |
-          npx esbuild scripts/tauri-android-runtime.ts --bundle --format=iife --platform=browser --outfile=public/tauri-android-runtime.js
+          mkdir -p /tmp/runtime-build
+          cp scripts/tauri-android-runtime.ts /tmp/runtime-build/
+          cd /tmp/runtime-build
+          npm init -y
+          npm install chess.js@1.0.0-beta.8 esbuild
+          ./node_modules/.bin/esbuild tauri-android-runtime.ts --bundle --format=iife --platform=browser --outfile="$GITHUB_WORKSPACE/public/tauri-android-runtime.js"
+          cd "$GITHUB_WORKSPACE"
           node scripts/prepare-capacitor-android.mjs
 
       - name: Compile Untouched En Croissant PC Frontend with Vite
         run: |
-          npx vite build --config vite.android.config.ts
+          ./node_modules/.bin/vite build --config vite.android.config.ts
 
-      - name: Generate Android Project, Set Landscape Orientation & Copy Official Icons
+      - name: Package Compiled Frontend into Android Project (Isolated Capacitor Build)
         run: |
+          mkdir -p /tmp/cap-apk
+          cp -r dist /tmp/cap-apk/dist
+          cp capacitor.config.json /tmp/cap-apk/capacitor.config.json
+          cd /tmp/cap-apk
+          npm init -y
+          npm install @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/android@6.2.0
           npx cap add android
           npx cap copy android
 
-          # Copy official En Croissant icon.png from src-tauri/icons/ into all Android mipmap folders
-          ICON_SRC="src-tauri/icons/icon.png"
+          ICON_SRC="$GITHUB_WORKSPACE/src-tauri/icons/icon.png"
           if [ ! -f "$ICON_SRC" ]; then
-            ICON_SRC="src-tauri/icons/128x128@2x.png"
+            ICON_SRC="$GITHUB_WORKSPACE/src-tauri/icons/128x128@2x.png"
           fi
           for dir in android/app/src/main/res/mipmap-*; do
             if [ -d "$dir" ]; then
@@ -79,26 +96,24 @@ jobs:
             fi
           done
 
-          # Configure Horizontal (sensorLandscape) PC Layout & Cleartext/Internet in AndroidManifest.xml
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
             sed -i 's/android:name=".MainActivity"/android:name=".MainActivity" android:screenOrientation="sensorLandscape"/g' "$MANIFEST"
           fi
 
-          # Set minSdkVersion to 28 (Android 9.0+) in variables.gradle
           if [ -f "android/variables.gradle" ]; then
             sed -i 's/minSdkVersion = [0-9]*/minSdkVersion = 28/g' android/variables.gradle
           fi
 
       - name: Assemble Release APK with Gradle
         run: |
-          cd android
+          cd /tmp/cap-apk/android
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
 
       - name: Sign & Verify Android 9+ APK
         run: |
-          UNSIGNED_APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          UNSIGNED_APK=$(find /tmp/cap-apk/android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
           echo "Found unsigned APK: $UNSIGNED_APK"
 
           keytool -genkey -v -keystore release-key.jks -keyalg RSA -keysize 2048 -validity 10000 \
@@ -112,9 +127,9 @@ jobs:
           "$ZIPALIGN" -v -p 4 "$UNSIGNED_APK" en-croissant-aligned.apk
           "$APKSIGNER" sign --ks release-key.jks --ks-key-alias encroissant \
             --ks-pass pass:encroissant123 --key-pass pass:encroissant123 \
-            --out en-croissant-v0.16.1-android-arm64.apk en-croissant-aligned.apk
-          "$APKSIGNER" verify -v en-croissant-v0.16.1-android-arm64.apk
-          ls -lh en-croissant-v0.16.1-android-arm64.apk
+            --out "$GITHUB_WORKSPACE/en-croissant-v0.16.1-android-arm64.apk" en-croissant-aligned.apk
+          "$APKSIGNER" verify -v "$GITHUB_WORKSPACE/en-croissant-v0.16.1-android-arm64.apk"
+          ls -lh "$GITHUB_WORKSPACE/en-croissant-v0.16.1-android-arm64.apk"
 
       - name: Upload Signed Android APK as Workflow Artifact
         uses: actions/upload-artifact@v4
