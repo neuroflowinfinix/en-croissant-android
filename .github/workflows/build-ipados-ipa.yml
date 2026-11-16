@@ -1,0 +1,131 @@
+name: Build En Croissant iPadOS & iOS 15+ IPA (Exact PC UI + Stockfish 19)
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-ipados-ipa:
+    name: Build Exact En Croissant PC UI & Stockfish 19 iPadOS 15+ IPA
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Clone Official franciscoBSalgueiro/en-croissant Repository
+        run: |
+          if [ ! -d "src" ] || [ ! -f "vite.config.ts" ]; then
+            echo "Cloning official franciscoBSalgueiro/en-croissant (74 MB)..."
+            git clone --depth 1 https://github.com/franciscoBSalgueiro/en-croissant.git /tmp/ec-upstream
+            rm -rf /tmp/ec-upstream/.git /tmp/ec-upstream/.github
+            cp -rn /tmp/ec-upstream/* . 2>/dev/null || true
+            cp -rn /tmp/ec-upstream/.* . 2>/dev/null || true
+          fi
+
+      - name: Install pnpm@latest & En Croissant Frontend Dependencies
+        run: |
+          npm install -g pnpm@latest
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            delete p.packageManager;
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+          pnpm install --no-frozen-lockfile --ignore-scripts || npm install --legacy-peer-deps --ignore-scripts
+          pnpm rebuild esbuild 2>/dev/null || npm rebuild esbuild 2>/dev/null || true
+
+      - name: Prepare Stockfish 19.0.1 Engines & Bundle Tauri iPadOS/Android Runtime
+        run: |
+          node scripts/prepare-capacitor-android.mjs
+          mkdir -p /tmp/runtime-build
+          cp scripts/tauri-android-runtime.ts /tmp/runtime-build/
+          cd /tmp/runtime-build
+          npm init -y
+          npm install chess.js@1.0.0-beta.8 esbuild
+          ./node_modules/.bin/esbuild tauri-android-runtime.ts --bundle --format=iife --platform=browser --outfile="$GITHUB_WORKSPACE/public/tauri-android-runtime.js"
+          cd "$GITHUB_WORKSPACE"
+
+      - name: Compile Untouched En Croissant PC Frontend with Vite
+        run: |
+          ./node_modules/.bin/vite build --config vite.android.config.ts
+
+      - name: Package Compiled Frontend into iPadOS 15+ Project (Isolated Capacitor iOS Build)
+        run: |
+          mkdir -p /tmp/cap-ios
+          cp -r dist /tmp/cap-ios/dist
+          cp capacitor.config.json /tmp/cap-ios/capacitor.config.json
+          cd /tmp/cap-ios
+          npm init -y
+          npm install @capacitor/core@6.2.0 @capacitor/cli@6.2.0 @capacitor/ios@6.2.0
+          npx cap add ios
+          npx cap copy ios
+
+          ICON_SRC="$GITHUB_WORKSPACE/src-tauri/icons/icon.png"
+          if [ ! -f "$ICON_SRC" ]; then
+            ICON_SRC="$GITHUB_WORKSPACE/src-tauri/icons/128x128@2x.png"
+          fi
+          APPICON_DEST="/tmp/cap-ios/ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png"
+          if [ -d "$(dirname "$APPICON_DEST")" ]; then
+            sips -s format png -z 1024 1024 "$ICON_SRC" --out "$APPICON_DEST" || cp "$ICON_SRC" "$APPICON_DEST"
+          fi
+
+          node "$GITHUB_WORKSPACE/scripts/configure-capacitor-ios.mjs"
+          cd /tmp/cap-ios/ios/App
+          pod install --no-repo-update || pod install
+
+      - name: Compile & Package iPadOS 15+ Release IPA with Xcode
+        run: |
+          cd /tmp/cap-ios/ios/App
+          xcodebuild -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath /tmp/cap-ios/build \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            TARGETED_DEVICE_FAMILY="1,2" \
+            ARCHS="arm64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          APP_BUNDLE=$(find /tmp/cap-ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          echo "Found compiled iPadOS .app bundle: $APP_BUNDLE"
+          mkdir -p /tmp/ipa-stage/Payload
+          cp -R "$APP_BUNDLE" /tmp/ipa-stage/Payload/App.app
+          codesign --force --deep --sign - /tmp/ipa-stage/Payload/App.app || true
+          cd /tmp/ipa-stage
+          zip -qry "$GITHUB_WORKSPACE/en-croissant-v0.16.1-ipados15-arm64.ipa" Payload
+          ls -lh "$GITHUB_WORKSPACE/en-croissant-v0.16.1-ipados15-arm64.ipa"
+
+      - name: Upload iPadOS 15+ IPA as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: en-croissant-ipados-ipa
+          path: en-croissant-v0.16.1-ipados15-arm64.ipa
+          retention-days: 90
+
+      - name: Attach iPadOS 15+ IPA to v0.16.2-mobile Release Without Touching v0.16.1-android
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v0.16.2-mobile >/dev/null 2>&1; then
+            gh release upload v0.16.2-mobile en-croissant-v0.16.1-ipados15-arm64.ipa --clobber
+          else
+            gh release create v0.16.2-mobile en-croissant-v0.16.1-ipados15-arm64.ipa \
+              --title "En Croissant v0.16.2 Mobile (Android 9+ APK & iPadOS 15+ IPA + Stockfish 19.0.1)" \
+              --notes "Built for the chess community by neuroflowinfinix (D. Ujjwal) <neuroflow_infinix@outlook.in>. Includes the Android 9.0+ (API 28+) ARM64 APK and iPadOS/iOS 15.0+ ARM64 IPA with the exact franciscoBSalgueiro/en-croissant PC interface, Stockfish 19.0.1 & Stockfish 18 single-file JS/WASM engines, White-relative Game Report evaluation & annotations, Player Overview/Ratings/Openings panels, and persistent storage."
+          fi
